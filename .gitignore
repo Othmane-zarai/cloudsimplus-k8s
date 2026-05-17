@@ -10,6 +10,8 @@ maven-wrapper.jar
 *.ipr
 *.iws
 
+.claude
+
 #Eclipse project files
 .classpath
 .project
