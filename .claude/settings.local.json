@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -n \"results\\\\\\\\\" \"C:\\\\\\\\Users\\\\\\\\Administrator\\\\\\\\Documents\\\\\\\\cloudsimplus-pr\\\\\\\\deployment\\\\\\\\EMPIRICAL_VALIDATION.md\")",
+      "Bash(xargs grep -l \"@Test\\\\|@ParameterizedTest\")",
+      "Bash(xargs grep -E \"@Test|@ParameterizedTest\")",
+      "Bash(python comparison-scripts/rq2_nrmsd.py deployment/rq2)",
+      "Bash(python comparison-scripts/rq4_latency.py deployment/rq4/real-latency.csv deployment/rq4/sim-latency.csv)",
+      "Bash(python -c \"data=open\\('deployment/rq4/latency-comparison.csv'\\).read\\(\\); print\\(repr\\(data[:200]\\)\\)\")",
+      "Bash(mvn clean *)",
+      "Bash(./mvnw.cmd clean *)",
+      "Bash(./mvnw.cmd test *)",
+      "Bash(grep -n \"bibliography\\\\|biblio\\\\|\\\\\\\\\\\\\\\\begin{thebibliography}\\\\|\\\\\\\\\\\\\\\\bibitem\" 'C:/Users/Administrator/Documents/microservices-sim-poc/paper/kubernetes-cloudsimplus.tex')",
+      "Bash(grep -n \"ifnum\\\\|NAT@\\\\|\\\\\\\\\\\\\\\\cite\" 'C:/Users/Administrator/Documents/microservices-sim-poc/paper/NJDnatbib.sty')",
+      "Bash(grep -n \"\\\\\\\\\\\\\\\\cite{\" 'C:/Users/Administrator/Documents/microservices-sim-poc/paper/kubernetes-cloudsimplus.tex')",
+      "Bash(grep -n \"\\\\\\\\\\\\\\\\ifnum\" 'C:/Users/Administrator/Documents/microservices-sim-poc/paper/NJDnatbib.sty')",
+      "Bash(grep -v \"\\\\\\\\\\\\\\\\newblock\\\\|\\\\\\\\\\\\\\\\bibitem\")",
+      "Bash(dir \"C:\\\\Users\\\\Administrator\\\\Documents\\\\cloudsimplus\")"
+    ]
+  }
+}
