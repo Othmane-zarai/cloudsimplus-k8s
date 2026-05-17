@@ -207,7 +207,11 @@ public non-sealed class DatacenterSimple extends CloudSimEntity implements Datac
     }
 
     private void setHostList(@NonNull final List<? extends Host> hostList) {
-        this.hostList = hostList;
+        // Always wrap in a mutable ArrayList so runtime addHost / removeHost
+        // operations (used by the K8s ClusterAutoscaler and other dynamic
+        // provisioning paths) succeed regardless of whether the caller passed
+        // List.of(...) or a mutable list.
+        this.hostList = new ArrayList<>(hostList);
         setupHosts();
     }
 
