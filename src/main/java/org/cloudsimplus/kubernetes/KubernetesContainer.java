@@ -65,6 +65,14 @@ public class KubernetesContainer extends CloudletSimple {
     @NonNull
     private final Resources limits;
 
+    /**
+     * Effective limits after a VPA in-place resize. Starts equal to {@link #limits} (the
+     * declared spec). Only mutated by {@link #applyInPlaceResize(Resources)}; the original
+     * {@link #limits} field is never changed, mirroring the Kubernetes distinction between
+     * the admitted spec and the running container's actual resource allocation.
+     */
+    private Resources effectiveLimits;
+
     @NonNull
     private RestartPolicy restartPolicy = RestartPolicy.ALWAYS;
 
@@ -103,6 +111,7 @@ public class KubernetesContainer extends CloudletSimple {
                 "Container '%s': limits must be >= requests (got requests=%s, limits=%s)"
                     .formatted(containerName, this.requests, this.limits));
         }
+        this.effectiveLimits = this.limits;
         setUtilizationModelCpu(new UtilizationModelFull());
     }
 
@@ -123,6 +132,30 @@ public class KubernetesContainer extends CloudletSimple {
             return 1;
         }
         return Math.max(1, (requests.milliCpu() + 999) / 1000);
+    }
+
+    /**
+     * Applies a VPA in-place resource resize, updating the effective (running) limits
+     * without changing the declared spec returned by {@link #getLimits()}.
+     *
+     * <p>Called by {@link org.cloudsimplus.kubernetes.autoscaling.VerticalPodAutoscaler}
+     * in {@code AUTO} mode. The container cloudlet is reset and resubmitted by the VPA
+     * immediately after this call; the pod object is not evicted.</p>
+     *
+     * @param newLimits the new effective limits; must be non-null
+     * @return {@code this} for chaining
+     */
+    public KubernetesContainer applyInPlaceResize(final Resources newLimits) {
+        this.effectiveLimits = java.util.Objects.requireNonNull(newLimits, "newLimits");
+        return this;
+    }
+
+    /**
+     * Returns the currently effective resource limits. Equal to {@link #getLimits()} until
+     * a VPA in-place resize has been applied via {@link #applyInPlaceResize(Resources)}.
+     */
+    public Resources getEffectiveLimits() {
+        return effectiveLimits;
     }
 
     @Override

@@ -1,0 +1,22 @@
+{
+  "title": "CloudSim Plus-K8s: Kubernetes container-orchestration extension for CloudSim Plus",
+  "description": "The org.cloudsimplus.kubernetes extension and topology substrate (TopologyAwareHost, VmAllocationPolicyTopologyAware) that back the paper \"CloudSim Plus-K8s: A Contract-Driven Extension for Kubernetes Container Orchestration Simulation.\" It models Kubernetes scheduling (filter/score), horizontal and vertical autoscaling, workload controllers, pod lifecycle, and per-service microservice latency under an explicit, testable fidelity contract. Built as an extension of CloudSim Plus (org.cloudsimplus:cloudsimplus, https://cloudsimplus.org) and distributed under its GPL-3.0 licence.",
+  "upload_type": "software",
+  "license": "GPL-3.0-or-later",
+  "access_right": "open",
+  "version": "1.0.0-k8s",
+  "creators": [
+    { "name": "Zarai, Othmane", "orcid": "0000-0000-0000-0000" },
+    { "name": "Ettazi, Widad" },
+    { "name": "Driss, Riane" }
+  ],
+  "keywords": [
+    "CloudSim Plus",
+    "Kubernetes",
+    "discrete-event simulation",
+    "container orchestration",
+    "scheduling",
+    "autoscaling",
+    "reproducibility"
+  ]
+}

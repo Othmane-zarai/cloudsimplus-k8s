@@ -38,3 +38,7 @@ Test.java
 deploy.sh
 checkstyle.sh
 node_modules/
+
+# Profiling / heap dumps (keep the .md findings, not the multi-MB binaries)
+*.jfr
+*.hprof

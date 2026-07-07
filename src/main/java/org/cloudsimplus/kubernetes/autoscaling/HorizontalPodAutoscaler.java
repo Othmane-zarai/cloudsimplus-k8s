@@ -116,6 +116,27 @@ public class HorizontalPodAutoscaler implements Tick {
     private double lastScaleAt = -1.0;
 
     /**
+     * Two-stage metrics pipeline modelling the kubelet-scrape → controller-sync
+     * lag. The HPA feeds it the live pod gauge on every tick and reads back
+     * the (intentionally stale) snapshot when making a decision.
+     */
+    private MetricsPipeline pipeline = new MetricsPipeline();
+
+    /**
+     * Direction-specific scaling policy for the scale-up branch. Default mirrors
+     * upstream K8s {@code behavior.scaleUp.policies: [{Pods,4},{Percent,100}]}
+     * with {@code selectPolicy: Max}.
+     */
+    private ScalingPolicy scaleUpPolicy = ScalingPolicy.SCALE_UP_DEFAULT;
+
+    /**
+     * Direction-specific scaling policy for the scale-down branch. Default mirrors
+     * upstream K8s {@code behavior.scaleDown.policies: [{Percent,100}]} with
+     * {@code selectPolicy: Min}.
+     */
+    private ScalingPolicy scaleDownPolicy = ScalingPolicy.SCALE_DOWN_DEFAULT;
+
+    /**
      * Legacy single-cooldown setter. Sets both up- and down-cooldowns to
      * {@code seconds} so callers who haven't migrated to the K8s-1.18+
      * split-cooldown API keep their prior behaviour.
@@ -184,10 +205,38 @@ public class HorizontalPodAutoscaler implements Tick {
         if (readyPods.isEmpty()) {
             return;
         }
-        final double avg = readyPods.stream()
-            .mapToDouble(KubernetesPod::getCpuPercentUtilization)
-            .average()
-            .orElse(0.0);
+
+        // Stage 1 — scrape: push every Ready pod's live gauge into the
+        // metrics pipeline. The pipeline silently drops samples that arrive
+        // faster than scrapeIntervalSeconds, modelling the kubelet's fixed
+        // cadence.
+        for (final var pod : readyPods) {
+            pipeline.record(
+                pod.getId(),
+                clockTime,
+                pod.getCpuPercentUtilization(),
+                pod.getRam().getPercentUtilization());
+        }
+
+        // Stage 2 — sync: read back the snapshot dated at-or-before
+        // (clockTime - syncDelaySeconds). Pods without a usable snapshot yet
+        // (early in the run, or after a long staleness) are skipped so the
+        // average doesn't get diluted by sentinel zeros.
+        double sum = 0.0;
+        int counted = 0;
+        for (final var pod : readyPods) {
+            final var snap = pipeline.snapshot(pod.getId(), clockTime);
+            if (snap.isEmpty()) {
+                continue;
+            }
+            sum += snap.cpu();
+            counted++;
+        }
+        if (counted == 0) {
+            // Not enough scraped history yet — wait for the pipeline to warm up.
+            return;
+        }
+        final double avg = sum / counted;
         if (avg < 0) {
             // Genuine undefined-utilisation case (negative is non-physical).
             return;
@@ -198,8 +247,12 @@ public class HorizontalPodAutoscaler implements Tick {
             return;
         }
         final int current = desiredReplicasSupplier.getAsInt();
-        final int desired = Math.max(minReplicas, Math.min(maxReplicas,
-            (int) Math.ceil(current * avg / targetCpuUtilization)));
+        final int raw = (int) Math.ceil(current * avg / targetCpuUtilization);
+        // Apply the direction-specific ScalingPolicy cap before clamping to
+        // [minReplicas, maxReplicas]. A DISABLED policy turns the corresponding
+        // direction into a no-op entirely.
+        final int proposed = applyScalingPolicy(current, raw);
+        final int desired = Math.max(minReplicas, Math.min(maxReplicas, proposed));
         if (desired != current) {
             // K8s 1.18+ stabilisation windows are evaluated against the
             // *proposed* direction: scale-up gated by cooldownScaleUpSeconds,
@@ -216,5 +269,31 @@ public class HorizontalPodAutoscaler implements Tick {
             desiredReplicasSetter.accept(desired);
             lastScaleAt = clockTime;
         }
+    }
+
+    /**
+     * Caps {@code raw} so its distance from {@code current} respects the
+     * direction-specific {@link ScalingPolicy}. {@link SelectPolicy#DISABLED}
+     * vetoes any movement in that direction (returns {@code current}).
+     */
+    private int applyScalingPolicy(final int current, final int raw) {
+        if (raw == current) {
+            return current;
+        }
+        final ScalingPolicy policy = raw > current ? scaleUpPolicy : scaleDownPolicy;
+        if (policy == null) {
+            return raw;
+        }
+        if (policy.select() == SelectPolicy.DISABLED) {
+            return current;
+        }
+        final int cap = policy.resolveCap(current);
+        if (cap == Integer.MAX_VALUE) {
+            return raw;
+        }
+        if (raw > current) {
+            return Math.min(raw, current + cap);
+        }
+        return Math.max(raw, current - cap);
     }
 }

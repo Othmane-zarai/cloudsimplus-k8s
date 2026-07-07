@@ -27,6 +27,8 @@ import lombok.Getter;
 import lombok.NonNull;
 import lombok.Setter;
 import lombok.experimental.Accessors;
+import org.cloudsimplus.kubernetes.networking.queueing.QueueingModel;
+import org.cloudsimplus.kubernetes.networking.queueing.ZeroLatencyModel;
 import org.cloudsimplus.vms.Vm;
 
 import java.util.Collections;
@@ -69,6 +71,15 @@ public class KubernetesService {
     private Supplier<List<KubernetesPod>> podSource = Collections::emptyList;
 
     private int roundRobinIndex;
+
+    /**
+     * The queueing-theoretic latency model attached to this service.  Defaults
+     * to {@link ZeroLatencyModel} so that pre-existing simulations continue to
+     * observe zero per-request latency.  Lombok generates a chained {@code
+     * setQueueingModel(QueueingModel)} setter for this field.
+     */
+    @NonNull
+    private QueueingModel queueingModel = ZeroLatencyModel.INSTANCE;
 
     public KubernetesService(final String name, final Namespace namespace, final LabelSelector selector) {
         if (name == null) {
@@ -124,6 +135,20 @@ public class KubernetesService {
         final var pod = pods.get(roundRobinIndex % pods.size());
         roundRobinIndex = (roundRobinIndex + 1) % pods.size();
         return pod;
+    }
+
+    /**
+     * Samples one end-to-end response-time observation from the configured
+     * {@link #getQueueingModel() queueing model}, given the current aggregate
+     * arrival rate in requests per second.
+     *
+     * @param arrivalRate λ in req/s
+     * @return a response-time sample in seconds (may be
+     *         {@link Double#POSITIVE_INFINITY} when the queue is saturated)
+     * @see QueueingModel#draw(double)
+     */
+    public double handleRequest(final double arrivalRate) {
+        return queueingModel.draw(arrivalRate);
     }
 
     @Override

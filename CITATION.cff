@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite both the paper and this archived snapshot."
+title: "CloudSim Plus-K8s: Kubernetes container-orchestration extension for CloudSim Plus"
+abstract: >-
+  The org.cloudsimplus.kubernetes extension and topology substrate for CloudSim Plus,
+  modelling Kubernetes scheduling, autoscaling, workload controllers, pod lifecycle,
+  and per-service microservice latency under a testable fidelity contract. Built as an
+  extension of CloudSim Plus (https://cloudsimplus.org).
+type: software
+authors:
+  - family-names: Zarai
+    given-names: Othmane
+    orcid: "https://orcid.org/0000-0000-0000-0000"
+  - family-names: Ettazi
+    given-names: Widad
+  - family-names: Driss
+    given-names: Riane
+version: 1.0.0-k8s
+date-released: "2026-07-07"
+license: GPL-3.0-or-later
+repository-code: "https://github.com/Othmane-zarai/cloudsimplus"
+keywords:
+  - CloudSim Plus
+  - Kubernetes
+  - discrete-event simulation
+  - container orchestration
+  - scheduling
+  - autoscaling
+  - reproducibility
+references:
+  - type: software
+    title: "CloudSim Plus"
+    authors:
+      - family-names: Silva Filho
+        given-names: Manoel Campos da
+    repository-code: "https://github.com/cloudsimplus/cloudsimplus"
+    url: "https://cloudsimplus.org"

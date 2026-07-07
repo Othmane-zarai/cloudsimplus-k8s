@@ -23,6 +23,12 @@
  */
 package org.cloudsimplus.kubernetes;
 
+import java.util.Objects;
+import java.util.concurrent.atomic.AtomicReference;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 /**
  * A Kubernetes-style resource quantity pair: CPU expressed in <i>millicores</i>
  * (Kubernetes' {@code m} suffix) and memory expressed in <i>MiB</i>
@@ -41,11 +47,37 @@ package org.cloudsimplus.kubernetes;
  */
 public record Resources(long milliCpu, long memMiB) {
 
+    private static final Logger LOG = LoggerFactory.getLogger(Resources.class.getSimpleName());
+
     /** Default conversion factor: 1 CPU core ↔ 1000 MIPS. */
     public static final int DEFAULT_MIPS_PER_CORE = 1000;
 
     /** Zero-resource sentinel ({@code 0m} CPU, {@code 0Mi} memory). */
     public static final Resources ZERO = new Resources(0, 0);
+
+    /**
+     * Process-wide {@link ParsingMode}; defaults to {@link ParsingMode#LENIENT_WARN}.
+     * Edge-case parsing semantics are documented canonically in
+     * {@code KUBERNETES.md} §3.1.
+     */
+    private static final AtomicReference<ParsingMode> PARSING_MODE =
+        new AtomicReference<>(ParsingMode.LENIENT_WARN);
+
+    /**
+     * Sets the process-wide parsing mode for {@link #parseCpu(String)} and
+     * {@link #parseMem(String)}.
+     *
+     * @param mode the new mode (non-null)
+     * @throws NullPointerException if {@code mode} is null
+     */
+    public static void setParsingMode(final ParsingMode mode) {
+        PARSING_MODE.set(Objects.requireNonNull(mode, "ParsingMode must not be null"));
+    }
+
+    /** @return the current process-wide parsing mode. */
+    public static ParsingMode getParsingMode() {
+        return PARSING_MODE.get();
+    }
 
     public Resources {
         if (milliCpu < 0) {
@@ -123,7 +155,24 @@ public record Resources(long milliCpu, long memMiB) {
         final String s = spec.trim();
         try {
             if (s.endsWith("m")) {
-                return Long.parseLong(s.substring(0, s.length() - 1).trim());
+                final String num = s.substring(0, s.length() - 1).trim();
+                try {
+                    return Long.parseLong(num);
+                } catch (NumberFormatException ex) {
+                    // Sub-millicore inputs such as "0.5m" — Kubernetes itself rejects
+                    // these, but parsing them as a double here lets us coerce-or-throw
+                    // based on the configured parsing mode.
+                    final double frac = Double.parseDouble(num);
+                    final ParsingMode mode = PARSING_MODE.get();
+                    if (mode == ParsingMode.STRICT) {
+                        throw new IllegalArgumentException(
+                            "Sub-millicore CPU spec is not allowed: '" + spec + "'");
+                    }
+                    LOG.warn("Sub-millicore CPU spec '{}' coerced to 0m (mode={}); "
+                        + "real Kubernetes rejects sub-millicore values", spec, mode);
+                    // Truncate towards zero: 0.5m, 0.9m, 1.4m all become 0m.
+                    return (long) frac;
+                }
             }
             // bare number: cores (possibly fractional like "0.5")
             return Math.round(Double.parseDouble(s) * 1000.0);
@@ -153,7 +202,31 @@ public record Resources(long milliCpu, long memMiB) {
         }
         final String s = spec.trim();
         final long bytes = parseMemBytes(s);
-        return bytes / (1024L * 1024L);
+        final long oneMiB = 1024L * 1024L;
+        if (bytes <= 0) {
+            // "0", "0Mi", etc. — real Kubernetes rejects a zero memory quantity.
+            final ParsingMode mode = PARSING_MODE.get();
+            if (mode == ParsingMode.STRICT) {
+                throw new IllegalArgumentException("memory must be > 0, got '" + spec + "'");
+            }
+            LOG.warn("Zero memory spec '{}' accepted as 0 MiB (mode={}); "
+                + "real Kubernetes rejects zero memory quantities", spec, mode);
+            return 0;
+        }
+        if (bytes < oneMiB) {
+            // Sub-MiB inputs such as "512Ki" — Kubernetes accepts these but the
+            // simulator's granularity is mebibytes. Coerce to the floor (1 MiB)
+            // or reject under STRICT.
+            final ParsingMode mode = PARSING_MODE.get();
+            if (mode == ParsingMode.STRICT) {
+                throw new IllegalArgumentException(
+                    "memory must be >= 1 MiB, got '" + spec + "' (" + bytes + " bytes)");
+            }
+            LOG.warn("Sub-MiB memory spec '{}' coerced to 1 MiB (mode={}); "
+                + "simulator granularity is 1 MiB", spec, mode);
+            return 1;
+        }
+        return bytes / oneMiB;
     }
 
     private static long parseMemBytes(final String s) {
