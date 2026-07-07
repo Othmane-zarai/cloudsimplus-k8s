@@ -112,6 +112,16 @@ public class ReplicaSetController implements Controller {
 
     @Override
     public void onPodLost(final KubernetesPod pod) {
+        // K8s semantics (A1 P0a fix): a pod that never reached a node
+        // (POD_SCHEDULED=false) stays in the ReplicaSet's desired count — the
+        // scheduler keeps retrying until the cluster grows or the pod is
+        // explicitly deleted. Only treat the pod as lost if it actually got
+        // bound to a node at some point. Without this guard, every
+        // failed-creation event triggers a fresh scaleUp() call next tick,
+        // producing an O(unschedulable × ticks) thrash that dominated RQ3.
+        if (!pod.isScheduled()) {
+            return;
+        }
         final var ordinalLabel = pod.getLabels().get(LABEL_POD_ORDINAL);
         if (ordinalLabel == null) {
             return;

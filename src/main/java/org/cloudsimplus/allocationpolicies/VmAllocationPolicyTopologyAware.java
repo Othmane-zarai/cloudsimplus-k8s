@@ -57,7 +57,7 @@ public class VmAllocationPolicyTopologyAware extends VmAllocationPolicyAbstract 
 
     public enum Policy {
         LATENCY_AWARE, COST_OPTIMIZED, AVAILABILITY_ZONE_SPREAD,
-        RACK_ANTI_AFFINITY, GEOGRAPHIC_SPREAD
+        RACK_ANTI_AFFINITY, GEOGRAPHIC_SPREAD, LEAST_ALLOCATED
     }
 
     /**
@@ -148,6 +148,7 @@ public class VmAllocationPolicyTopologyAware extends VmAllocationPolicyAbstract 
             case AVAILABILITY_ZONE_SPREAD  -> spreadScore(vm, host, TopologyAwareHost::getAvailabilityZone);
             case GEOGRAPHIC_SPREAD         -> spreadScore(vm, host, TopologyAwareHost::getRegion);
             case RACK_ANTI_AFFINITY        -> spreadScore(vm, host, TopologyAwareHost::getRackId);
+            case LEAST_ALLOCATED           -> leastAllocatedScore(host);
         };
         return policyScore + LEAST_ALLOCATED_WEIGHT * leastAllocatedScore(host);
     }

@@ -106,10 +106,18 @@ class ResourcesTest {
         // M2 fix: parseMem("0") used to return 1 because of an unconditional
         // floor. The floor belongs in KubernetesPod (RAM>0 invariant), not in
         // the parser, so explicit zero now round-trips faithfully.
+        // Under the default LENIENT_WARN parsing mode (§B.7), an explicit zero
+        // memory still parses to 0 — the warning makes the call visible to the
+        // operator without changing the numeric result.
         assertEquals(0, Resources.parseMem("0"));
         assertEquals(0, Resources.parseMem("0Mi"));
-        // Sub-MiB inputs (< 1 MiB) integer-divide to zero rather than being
-        // bumped up to 1 — also part of the M2 fix.
-        assertEquals(0, Resources.parseMem("512Ki"));
+    }
+
+    @Test
+    void parseMemSubMiBCoercedToOneMiBUnderLenient() {
+        // Default LENIENT_WARN mode coerces sub-MiB inputs (< 1 MiB) up to the
+        // simulator's 1 MiB granularity floor (§B.7). STRICT mode would throw;
+        // see ResourcesParsingModeTest for that path.
+        assertEquals(1, Resources.parseMem("512Ki"));
     }
 }

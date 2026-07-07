@@ -34,30 +34,40 @@ import org.cloudsimplus.kubernetes.lifecycle.Tick;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 /**
  * Vertical Pod Autoscaler — samples per-container CPU and memory utilisation
  * across the {@link ReplicaSetController}'s managed pods and produces sizing
- * <i>recommendations</i> for the container limits that would bring average
- * utilisation back to the configured targets.
+ * recommendations for the container limits that would bring average utilisation
+ * back to the configured targets.
  *
- * <p>This implementation honours the K8s VPA "<b>Off / Initial</b>" semantics:
- * recommendations are computed and exposed via
- * {@link #getRecommendedMilliCpu()} and {@link #getRecommendedMemMiB()} but
- * pods are <i>not</i> mutated automatically — {@link KubernetesContainer}
- * resource specs are immutable, and rewriting the {@link
- * org.cloudsimplus.kubernetes.controllers.PodTemplate} requires
- * template-aware glue that only the user can supply. Auto-recreate mode is
- * opt-in via {@link #setEvictOnRecommendation(boolean) evictOnRecommendation}:
- * when set, pods are destroyed so the ReplicaSet recreates them; users
- * combining VPA with a custom template can rebuild containers using the
- * latest recommendation.</p>
+ * <p>Three operating modes mirror the upstream Kubernetes VPA
+ * {@code updatePolicy.updateMode}:</p>
+ * <ul>
+ *   <li>{@link Mode#OFF} — recommendations are computed and exposed via
+ *       {@link #getRecommendedMilliCpu()} / {@link #getRecommendedMemMiB()};
+ *       no automatic action is taken.</li>
+ *   <li>{@link Mode#INITIAL} (<b>default</b>) — same as Off for running pods.
+ *       The {@link org.cloudsimplus.kubernetes.controllers.PodTemplate} can
+ *       read the latest recommendation when creating replacement pods, enabling
+ *       the user-driven evict-and-recreate pattern.</li>
+ *   <li>{@link Mode#AUTO} — applies the recommendation <b>in-place</b>:
+ *       {@link KubernetesContainer#applyInPlaceResize(Resources)} patches the
+ *       effective limits on each running container without evicting the pod,
+ *       mirroring the K8s 1.27+ {@code InPlacePodVerticalScaling} behaviour for
+ *       CPU (compressible; no restart required). Memory resize is modelled as a
+ *       documented simplification: effective limits are updated without a container
+ *       restart (the QoS-class reclassification side-effects of real K8s are not
+ *       simulated).</li>
+ * </ul>
  *
  * <p>Updates are gated by:</p>
  * <ul>
  *   <li>{@link #getTolerance() tolerance} — recommendations within ±tolerance
- *       of the current limit are suppressed.</li>
+ *       of the current effective limit are suppressed.</li>
  *   <li>{@link #getCooldownSeconds() cooldownSeconds} — minimum interval
  *       between actions, mirroring the K8s VPA updater's rate-limiter.</li>
  * </ul>
@@ -68,6 +78,22 @@ import java.util.List;
 @Accessors(chain = true)
 public class VerticalPodAutoscaler implements Tick {
 
+    /**
+     * Operating mode mirroring upstream Kubernetes VPA {@code updatePolicy.updateMode}.
+     */
+    public enum Mode {
+        /** Compute and expose recommendations; take no automatic action. */
+        OFF,
+        /** Same as Off for running pods (default). Template-driven recreation is user-managed. */
+        INITIAL,
+        /**
+         * Apply recommendations in-place: patch each container's effective limits and
+         * resubmit the cloudlet without evicting the pod (mirrors K8s 1.27+
+         * {@code InPlacePodVerticalScaling}).
+         */
+        AUTO
+    }
+
     private static final Logger LOG = LoggerFactory.getLogger(VerticalPodAutoscaler.class.getSimpleName());
 
     @NonNull
@@ -75,6 +101,9 @@ public class VerticalPodAutoscaler implements Tick {
 
     @NonNull
     private final ReplicaSetController target;
+
+    /** Operating mode; defaults to {@link Mode#INITIAL}. */
+    private Mode mode = Mode.INITIAL;
 
     /** Target average CPU utilisation in {@code (0, 1]}. Default 0.7 mirrors the upstream VPA recommender. */
     private double targetCpuUtilization = 0.7;
@@ -84,7 +113,7 @@ public class VerticalPodAutoscaler implements Tick {
 
     /**
      * Relative deadband around the target, in {@code [0, 1)}. A
-     * recommendation that would change a limit by less than
+     * recommendation that would change an effective limit by less than
      * {@code |limit| * tolerance} is suppressed.
      */
     private double tolerance = 0.10;
@@ -92,12 +121,40 @@ public class VerticalPodAutoscaler implements Tick {
     /** Minimum simulated seconds between two consecutive scale actions. */
     private double cooldownSeconds = 60.0;
 
-    /** When true, evict managed pods after a recommendation update so the RS recreates them. */
+    /**
+     * When true (and mode is not {@link Mode#AUTO}), evict managed pods after a
+     * recommendation update so the ReplicaSet recreates them from a user-updated template.
+     */
     private boolean evictOnRecommendation;
 
     private double lastActionAt = -1.0;
     private long recommendedMilliCpu;
     private long recommendedMemMiB;
+
+    /**
+     * Percentile of the recommendation history used as the headline estimate.
+     * Default {@code 0.90} mirrors the upstream VPA recommender's "confidence
+     * ratio" — the recommender assumes the true demand sits at the 90th
+     * percentile of recently observed need.
+     */
+    private double confidenceRatio = 0.90;
+
+    /**
+     * Multiplicative safety margin applied on top of the percentile estimate to
+     * leave headroom for memory bursts that would otherwise OOM the container.
+     * Default {@code 1.05} mirrors the upstream VPA's {@code --safety-margin-fraction}
+     * default (5 % above the observed peak).
+     */
+    private double oomHeadroom = 1.05;
+
+    /**
+     * Sliding window of raw per-tick recommendations (one entry per axis). Length
+     * {@code 8} matches the buffer choice in USER_SIDE_QUESTS §A.3. The percentile
+     * is computed over this window every tick — that, plus the OOM headroom and
+     * confidence ratio, gives the smoothed final recommendation.
+     */
+    private final CircularBuffer<Double> cpuRecommendationHistory = new CircularBuffer<>(8);
+    private final CircularBuffer<Double> memRecommendationHistory = new CircularBuffer<>(8);
 
     /**
      * Creates a VPA targeting the given ReplicaSet (or a Deployment's active
@@ -157,8 +214,45 @@ public class VerticalPodAutoscaler implements Tick {
         return this;
     }
 
+    /** Sets the operating mode. Defaults to {@link Mode#INITIAL}. */
+    public VerticalPodAutoscaler setMode(final Mode mode) {
+        this.mode = java.util.Objects.requireNonNull(mode, "mode");
+        return this;
+    }
+
     public VerticalPodAutoscaler setEvictOnRecommendation(final boolean value) {
         this.evictOnRecommendation = value;
+        return this;
+    }
+
+    /**
+     * Sets the percentile-of-history used to drive the recommendation. The
+     * upstream VPA recommender uses {@code 0.90}; values close to {@code 1.0}
+     * pick the recent peak (less smoothing, higher safety), values closer to
+     * {@code 0.5} smooth more aggressively.
+     *
+     * @param value in {@code (0, 1]}
+     */
+    public VerticalPodAutoscaler setConfidenceRatio(final double value) {
+        if (value <= 0.0 || value > 1.0) {
+            throw new IllegalArgumentException("confidenceRatio must be in (0, 1], got " + value);
+        }
+        this.confidenceRatio = value;
+        return this;
+    }
+
+    /**
+     * Sets the multiplicative OOM headroom applied above the percentile
+     * estimate. Default {@code 1.05} mirrors the upstream VPA recommender's
+     * {@code --safety-margin-fraction=0.05}.
+     *
+     * @param value must be {@code >= 1.0}
+     */
+    public VerticalPodAutoscaler setOomHeadroom(final double value) {
+        if (!(value >= 1.0) || !Double.isFinite(value)) {
+            throw new IllegalArgumentException("oomHeadroom must be finite and >= 1.0, got " + value);
+        }
+        this.oomHeadroom = value;
         return this;
     }
 
@@ -182,8 +276,10 @@ public class VerticalPodAutoscaler implements Tick {
             sumCpu += pod.getCpuPercentUtilization();
             sumRam += pod.getRam().getPercentUtilization();
             for (final var c : pod.getContainers()) {
-                currentMilliCpu = Math.max(currentMilliCpu, c.getLimits().milliCpu());
-                currentMemMiB = Math.max(currentMemMiB, c.getLimits().memMiB());
+                // Use effectiveLimits so subsequent ticks recommend relative to the
+                // already-resized allocation, not the original declared spec.
+                currentMilliCpu = Math.max(currentMilliCpu, c.getEffectiveLimits().milliCpu());
+                currentMemMiB = Math.max(currentMemMiB, c.getEffectiveLimits().memMiB());
             }
             n++;
         }
@@ -193,8 +289,20 @@ public class VerticalPodAutoscaler implements Tick {
         final double avgCpu = sumCpu / n;
         final double avgRam = sumRam / n;
 
-        final long newMilliCpu = recommend(currentMilliCpu, avgCpu, targetCpuUtilization);
-        final long newMemMiB = recommend(currentMemMiB, avgRam, targetRamUtilization);
+        // Push the raw per-tick observation (the K8s VPA "actual usage at target"
+        // estimate) into the recommendation history BEFORE reading the percentile.
+        // The recommendation buffer absorbs short-lived peaks: the headline
+        // estimate uses the configured confidence ratio (default p90) over the
+        // last `recommendationHistory.capacity()` samples.
+        if (avgCpu > 0 && targetCpuUtilization > 0) {
+            cpuRecommendationHistory.add(currentMilliCpu * avgCpu / targetCpuUtilization);
+        }
+        if (avgRam > 0 && targetRamUtilization > 0) {
+            memRecommendationHistory.add(currentMemMiB * avgRam / targetRamUtilization);
+        }
+
+        final long newMilliCpu = recommendCpu(currentMilliCpu, cpuRecommendationHistory);
+        final long newMemMiB = recommendMem(currentMemMiB, memRecommendationHistory);
 
         final boolean cpuChanged = outsideTolerance(currentMilliCpu, newMilliCpu);
         final boolean ramChanged = outsideTolerance(currentMemMiB, newMemMiB);
@@ -212,11 +320,37 @@ public class VerticalPodAutoscaler implements Tick {
             String.format("%.1f", avgRam * 100),
             newMilliCpu, newMemMiB, currentMilliCpu, currentMemMiB);
 
-        if (evictOnRecommendation) {
+        if (mode == Mode.AUTO) {
+            applyInPlace(pods, new Resources(newMilliCpu, newMemMiB));
+        } else if (evictOnRecommendation) {
             for (final var pod : pods) {
                 pod.getBroker().requestIdleVmDestruction(pod);
             }
         }
+    }
+
+    /**
+     * Applies an in-place resize to all non-init containers across the managed pods.
+     *
+     * <p>Patches each container's {@link KubernetesContainer#getEffectiveLimits() effectiveLimits}
+     * without restarting or evicting the pod, mirroring the K8s 1.27+
+     * {@code InPlacePodVerticalScaling} behaviour for CPU (a compressible resource): the cgroup
+     * quota is adjusted live, the container process is not interrupted. Memory resize would
+     * require a container restart in real Kubernetes; as a documented simplification, the
+     * simulator applies both CPU and memory limit updates in-place without a restart.</p>
+     */
+    private void applyInPlace(final List<KubernetesPod> pods, final Resources newRes) {
+        for (final var pod : pods) {
+            for (final var c : pod.getContainers()) {
+                if (c.isInitContainer()) {
+                    continue;
+                }
+                c.applyInPlaceResize(newRes);
+            }
+        }
+        LOG.info("{}: VPA '{}' AUTO: in-place resize applied to {} pod(s) (cpu={}m mem={}MiB)",
+            String.format("%.2f", lastActionAt), name, pods.size(),
+            newRes.milliCpu(), newRes.memMiB());
     }
 
     /** Latest sizing recommendation as a {@link Resources} record. */
@@ -224,11 +358,28 @@ public class VerticalPodAutoscaler implements Tick {
         return new Resources(recommendedMilliCpu, recommendedMemMiB);
     }
 
-    private static long recommend(final long current, final double avgUtil, final double target) {
-        if (avgUtil <= 0 || target <= 0) {
+    // CPU: history already holds (usage / targetCpu) so p90 is the recommendation directly.
+    // Upstream VPA applies no extra multiplier to CPU recommendations.
+    private long recommendCpu(final long current, final CircularBuffer<Double> history) {
+        return percentileOf(current, history, 1.0);
+    }
+
+    // Memory: apply oomHeadroom safety bump (upstream VPA bumps memory to avoid OOM kills).
+    private long recommendMem(final long current, final CircularBuffer<Double> history) {
+        return percentileOf(current, history, oomHeadroom);
+    }
+
+    private long percentileOf(final long current, final CircularBuffer<Double> history,
+                              final double multiplier) {
+        if (history.isEmpty()) {
             return current;
         }
-        return Math.max(1, Math.round(current * avgUtil / target));
+        final List<Double> sorted = new ArrayList<>(history.snapshot());
+        Collections.sort(sorted);
+        int index = (int) Math.ceil(confidenceRatio * sorted.size()) - 1;
+        index = Math.max(0, Math.min(index, sorted.size() - 1));
+        final double percentile = sorted.get(index);
+        return Math.max(1, Math.round(percentile * multiplier));
     }
 
     private boolean outsideTolerance(final long current, final long proposed) {

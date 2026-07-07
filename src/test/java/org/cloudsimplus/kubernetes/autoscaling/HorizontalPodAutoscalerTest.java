@@ -24,11 +24,13 @@
 package org.cloudsimplus.kubernetes.autoscaling;
 
 import org.cloudsimplus.kubernetes.KubernetesPod;
+import org.cloudsimplus.resources.Ram;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -40,22 +42,37 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
  */
 class HorizontalPodAutoscalerTest {
 
+    /** Monotone per-test id source so each mocked pod owns a distinct row in the metrics pipeline. */
+    private static final AtomicLong POD_IDS = new AtomicLong(1);
+
     private static KubernetesPod podAt(final double utilization) {
         final var p = Mockito.mock(KubernetesPod.class);
         Mockito.when(p.isReady()).thenReturn(true);
+        Mockito.when(p.getId()).thenReturn(POD_IDS.getAndIncrement());
         Mockito.when(p.getCpuPercentUtilization()).thenReturn(utilization);
+        // RAM gauge is consulted by the MetricsPipeline scrape — stub it to a
+        // benign zero so tests that don't care about memory aren't disturbed.
+        final var ram = Mockito.mock(Ram.class);
+        Mockito.when(ram.getPercentUtilization()).thenReturn(0.0);
+        Mockito.when(p.getRam()).thenReturn(ram);
         return p;
     }
 
     /**
      * Build an HPA whose "current replicas" are read from / written to
      * {@code current}, and whose pod source returns the supplied pods.
+     *
+     * <p>These tests install a {@link MetricsPipeline#zeroLag()} pipeline so the
+     * old "react on the first tick" semantics survive — the lag-aware
+     * production default (15 s scrape / 30 s sync) is exercised separately by
+     * {@code HorizontalPodAutoscalerPipelineTest}.</p>
      */
     private static HorizontalPodAutoscaler newHpa(
         final List<KubernetesPod> pods, final AtomicInteger current, final double target)
     {
         return new HorizontalPodAutoscaler(
-            "test-hpa", target, () -> pods, current::get, current::set);
+            "test-hpa", target, () -> pods, current::get, current::set)
+            .setPipeline(MetricsPipeline.zeroLag());
     }
 
     @Test
@@ -186,6 +203,7 @@ class HorizontalPodAutoscalerTest {
         final var pods = new java.util.ArrayList<KubernetesPod>(List.of(podAt(0.9), podAt(0.9)));
         final var hpa = new HorizontalPodAutoscaler(
             "h", 0.5, () -> pods, current::get, current::set)
+            .setPipeline(MetricsPipeline.zeroLag())
             .setMinReplicas(1).setMaxReplicas(10)
             .setCooldownScaleUpSeconds(0).setCooldownScaleDownSeconds(300.0);
 
@@ -222,6 +240,7 @@ class HorizontalPodAutoscalerTest {
         final var pods = new java.util.ArrayList<KubernetesPod>(List.of(podAt(0.9)));
         final var hpa = new HorizontalPodAutoscaler(
             "h", 0.5, () -> pods, current::get, current::set)
+            .setPipeline(MetricsPipeline.zeroLag())
             .setMinReplicas(1).setMaxReplicas(10).setCooldownSeconds(60.0);
 
         hpa.tick(0.0);

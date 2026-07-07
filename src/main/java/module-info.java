@@ -17,6 +17,8 @@ module cloudsimplus {
     exports org.cloudsimplus.kubernetes.scheduler;
     exports org.cloudsimplus.kubernetes.autoscaling;
     exports org.cloudsimplus.kubernetes.networking;
+    exports org.cloudsimplus.kubernetes.networking.queueing;
     exports org.cloudsimplus.kubernetes.storage;
     exports org.cloudsimplus.kubernetes.security;
+    exports org.cloudsimplus.kubernetes.tracing;
 }

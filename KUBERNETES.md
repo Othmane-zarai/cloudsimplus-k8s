@@ -90,6 +90,25 @@ A single, minimal change was made to existing CloudSim Plus code:
 - **`Resources`** — record `(milliCpu, memMiB)` plus parsers for K8s strings
   (`"500m"`, `"256Mi"`, `"1Gi"`) and a configurable millicores ↔ MIPS converter
   (`DEFAULT_MIPS_PER_CORE = 1000`).
+
+#### 3.1.1 Resource parsing modes
+
+`Resources.parseCpu` / `Resources.parseMem` accept several inputs that
+real Kubernetes itself would reject (zero memory, sub-MiB memory,
+sub-millicore CPU). The behaviour is selected by the process-wide
+`ParsingMode` enum (default `LENIENT_WARN`); set it via
+`Resources.setParsingMode(ParsingMode.STRICT)` when authoring scenarios
+where these inputs would mask a configuration bug.
+
+| Input        | `STRICT`                                                   | `LENIENT_WARN` (default)                |
+|--------------|------------------------------------------------------------|-----------------------------------------|
+| `"0"` memory | throws `IllegalArgumentException("memory must be > 0")`    | returns `0` MiB, emits `WARN` log entry |
+| `"512Ki"`    | throws — memory must be `≥ 1 MiB`                          | returns `1` MiB, emits `WARN` log entry |
+| `"0.5m"` CPU | throws — sub-millicore not allowed                         | returns `0` millicores, emits `WARN`    |
+
+This document is the canonical reference for these semantics; the
+companion paper (§sec:simplifications) cites it rather than duplicating
+the table.
 - **`LabelSet`**, **`LabelSelector`** — immutable label maps with full
   `matchLabels` + `matchExpressions` support.
 - **`Taint`**, **`Toleration`**, **`NodeAffinity`**, **`PodAffinity`**.

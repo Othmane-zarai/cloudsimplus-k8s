@@ -33,6 +33,8 @@ import org.cloudsimplus.kubernetes.Namespace;
 import org.cloudsimplus.kubernetes.autoscaling.ClusterAutoscaler;
 import org.cloudsimplus.kubernetes.autoscaling.HorizontalPodAutoscaler;
 import org.cloudsimplus.kubernetes.autoscaling.NodePool;
+import org.cloudsimplus.kubernetes.autoscaling.VerticalPodAutoscaler;
+import org.cloudsimplus.kubernetes.autoscaling.VerticalPodAutoscaler.Mode;
 import org.cloudsimplus.kubernetes.builders.ContainerBuilder;
 import org.cloudsimplus.kubernetes.builders.NodeBuilder;
 import org.cloudsimplus.kubernetes.builders.PodBuilder;
@@ -361,6 +363,78 @@ public class KubernetesAutoscalingTest {
         // ceil(3 * 0.5 / 0.5) = 3 → no change. Allow a small jitter for clock-tick rounding.
         assertEquals(3, rs.getDesiredReplicas(),
             "HPA should hold steady when utilization equals target");
+    }
+
+    // ------------------------------------------------------------------
+    // VPA Auto mode
+    // ------------------------------------------------------------------
+
+    @Test
+    void vpaAutoModeResizesContainerCpuInPlaceWithoutEviction() {
+        // 4-node cluster, 3 replicas at 90% CPU, VPA AUTO targeting 70%.
+        // Expected: VPA fires after cooldown, effectiveLimits increases in-place.
+        final var sim = new CloudSimPlus();
+
+        final var nodes = IntStream.range(0, 4)
+            .mapToObj(i -> NodeBuilder.of("n" + i).pes(4, 1000).ram(8_192).build())
+            .toList();
+        new DatacenterSimple(sim, nodes, new KubernetesScheduler(Policy.COST_OPTIMIZED));
+
+        final var broker = new KubernetesClusterBroker(sim).setControllerTickIntervalSeconds(1.0);
+
+        final int initialMilliCpu = 500;
+        final var rs = new ReplicaSetController(
+            broker.getControllerManager().allocateUid(),
+            "api", ns,
+            new PodTemplate(ord -> PodBuilder.of("api-" + ord)
+                .label("app", "api")
+                .container(ContainerBuilder.of("srv")
+                    .cpu(initialMilliCpu + "m").mem("256Mi")
+                    .length(1_000_000)
+                    .cpuUtilization(new UtilizationModelDynamic(0.9))
+                    .build())
+                .build()),
+            /* initial replicas */ 3);
+        broker.addController(rs);
+
+        final var vpa = new VerticalPodAutoscaler("api-vpa", rs)
+            .setMode(Mode.AUTO)
+            .setTargetCpuUtilization(0.7)
+            .setCooldownSeconds(5.0);
+        broker.registerTick(vpa);
+
+        // Track effectiveLimits during the simulation (managed map is cleared at shutdown).
+        final long[] maxObservedCpu = { initialMilliCpu };
+        final boolean[] evictionDetected = { false };
+        final AtomicInteger managedCountAtPeak = new AtomicInteger(0);
+        broker.registerTick(clock -> {
+            final var pods = rs.getManagedPods();
+            if (pods.size() > managedCountAtPeak.get()) {
+                managedCountAtPeak.set(pods.size());
+            }
+            pods.stream()
+                .flatMap(p -> p.getContainers().stream())
+                .mapToLong(c -> c.getEffectiveLimits().milliCpu())
+                .max()
+                .ifPresent(cpu -> maxObservedCpu[0] = Math.max(maxObservedCpu[0], cpu));
+        });
+
+        run(sim, 60.0);
+
+        // VPA must have produced a recommendation.
+        assertTrue(vpa.getRecommendedMilliCpu() > initialMilliCpu,
+            "VPA must recommend more CPU than the initial " + initialMilliCpu + "m " +
+            "(got " + vpa.getRecommendedMilliCpu() + "m)");
+
+        // At least 3 pods were managed at peak (no premature eviction).
+        assertEquals(3, managedCountAtPeak.get(),
+            "All 3 pods must have been running at peak (AUTO mode must not evict; got " +
+            managedCountAtPeak.get() + ")");
+
+        // The in-place resize must have raised effectiveLimits above the initial spec.
+        assertTrue(maxObservedCpu[0] > initialMilliCpu,
+            "effectiveLimits.milliCpu must exceed the initial " + initialMilliCpu +
+            "m after AUTO-mode resize (max observed = " + maxObservedCpu[0] + "m)");
     }
 
     // ------------------------------------------------------------------

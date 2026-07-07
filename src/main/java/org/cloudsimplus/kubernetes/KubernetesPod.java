@@ -233,6 +233,18 @@ public class KubernetesPod extends VmSimple {
         return Boolean.TRUE.equals(conditions.get(PodCondition.READY));
     }
 
+    /**
+     * @return whether this pod's {@link PodCondition#POD_SCHEDULED} condition
+     *         is currently true. The kubelet sets this on successful placement,
+     *         distinguishing a never-placed Pending pod (POD_SCHEDULED=false)
+     *         from a placed pod that may transition into other states.
+     *         Used by {@link org.cloudsimplus.kubernetes.controllers.ReplicaSetController}
+     *         to skip "lost" events for pods that never bound to a node.
+     */
+    public boolean isScheduled() {
+        return Boolean.TRUE.equals(conditions.get(PodCondition.POD_SCHEDULED));
+    }
+
     /** Sets a single pod condition; chainable. */
     public KubernetesPod setCondition(@NonNull final PodCondition condition, final boolean value) {
         conditions.put(condition, value);

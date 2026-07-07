@@ -28,6 +28,7 @@ import lombok.Setter;
 import lombok.experimental.Accessors;
 import org.cloudsimplus.allocationpolicies.VmAllocationPolicyTopologyAware;
 import org.cloudsimplus.hosts.Host;
+import org.cloudsimplus.hosts.HostSuitability;
 import org.cloudsimplus.kubernetes.KubernetesNode;
 import org.cloudsimplus.kubernetes.KubernetesPod;
 import org.cloudsimplus.kubernetes.PodAffinity;
@@ -35,6 +36,7 @@ import org.cloudsimplus.kubernetes.Taint;
 import org.cloudsimplus.kubernetes.Toleration;
 import org.cloudsimplus.vms.Vm;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -70,6 +72,35 @@ import java.util.function.Supplier;
  * <p>Non-K8s VMs / non-K8s hosts fall straight through to the parent's
  * behavior, so this policy is safe to use in mixed scenarios.</p>
  *
+ * <h2>Determinism contract</h2>
+ *
+ * <p>For a fixed workload (the same pods submitted in the same order, the
+ * same node list, the same parent topology policy parameters) the
+ * placement timeline produced by this scheduler is deterministic, with
+ * exactly one source of nondeterminism:</p>
+ *
+ * <ul>
+ *   <li>The {@link #tieBreakStrategy} object. {@link TieBreakStrategy#lexical()}
+ *       (the default), {@link TieBreakStrategy#firstFit()},
+ *       {@link TieBreakStrategy#lowestUid()}, and
+ *       {@link TieBreakStrategy#roundRobin()} are deterministic functions of
+ *       the input host list and produce identical placements across JVMs.
+ *       {@link TieBreakStrategy#random(long)} is deterministic only for a
+ *       fixed seed — two runs with the same seed produce identical
+ *       placement timelines; two runs with different seeds will diverge on
+ *       tied-score decisions.</li>
+ * </ul>
+ *
+ * <p>The scheduler does not introduce any other source of randomness:
+ * the filter phase is purely set-membership over labels and toleration
+ * predicates; the score phase is a deterministic real-valued function
+ * of pod and node state; the eviction-style preemption hook
+ * ({@link #attemptPreemption}) iterates in priority order with stable
+ * sub-orderings. Callers that need bit-identical event timelines across
+ * machines should select {@link TieBreakStrategy#lexical()} (the
+ * default) or {@link TieBreakStrategy#random(long)} with an explicitly
+ * pinned seed.</p>
+ *
  * @since CloudSim Plus 9.0.0
  */
 @Getter @Setter @Accessors(chain = true)
@@ -77,17 +108,6 @@ public class KubernetesScheduler extends VmAllocationPolicyTopologyAware {
 
     /** Score penalty added for each PreferNoSchedule taint not tolerated by the pod. */
     public static final double PREFER_NO_SCHEDULE_PENALTY = 10.0;
-
-    /**
-     * Score bonus awarded for each {@code NoSchedule} / {@code NoExecute} taint
-     * on a candidate node that the pod's tolerations cover. Models a variant of
-     * Kubernetes' {@code TaintTolerationPriority}: a pod that explicitly tolerates
-     * a node's hard taint is treated as having an intentional preference for
-     * that node (not merely permission to use it), so the node scores better on
-     * ties. {@link Taint.Effect#PREFER_NO_SCHEDULE} taints are excluded — they
-     * are handled separately by {@link #preferNoSchedulePenalty}.
-     */
-    public static final double TAINT_TOLERATION_BONUS = 5.0;
 
     /**
      * Default scale factor applied to K8s score contributions (NodeAffinity
@@ -137,22 +157,28 @@ public class KubernetesScheduler extends VmAllocationPolicyTopologyAware {
     public static final double TIE_BREAK_EPSILON = 1.0e-9;
 
     /**
-     * Per-placement-pass cache of placed pods. Built once at the start of
-     * {@link #defaultFindHostForVm(Vm)} so PodAffinity filter + score helpers
-     * don't re-scan every host's vmList for every candidate. Without it the
-     * scheduler is O(P · H · |vms|) per pod, which sinks RQ3 scalability.
-     * M7 fix.
+     * Cached snapshot of placed pods reused across {@link #defaultFindHostForVm(Vm)}
+     * calls until invalidated by a placement or deallocation event (A1 P0b fix).
+     * Without this cache the scheduler is O(P · H · |vms|) per pod, dominating
+     * RQ3 scalability — see {@code docs/profiling/before-A1-findings.md}.
+     * Mutated by {@link #invalidatePlacedCache()}.
      */
     private List<KubernetesPod> placedCache;
 
     /**
-     * Per-placement-pass map from host id to that host's rank in a lexical
-     * sort of {@link KubernetesNode#effectiveName()}. Used by
-     * {@link #score(Vm, Host)} to add a deterministic tie-break so the same
-     * simulation produces the same placement across JVMs (E5 fix). Built once
-     * per {@link #defaultFindHostForVm(Vm)} call and cleared on exit.
+     * Cached host-id → rank map produced by {@link #tieBreakStrategy}. Refreshed
+     * lazily; the host list rarely changes (only on ClusterAutoscaler events),
+     * so we keep this until {@link #invalidateHostRankCache()} fires.
      */
-    private Map<Long, Integer> lexicalRankCache;
+    private Map<Long, Integer> hostRankCache;
+
+    /**
+     * Pluggable strategy for breaking score ties (A4). Defaults to lexicographic
+     * order for backwards compatibility with the pre-A4 deterministic
+     * behaviour; production-fidelity comparisons should switch to
+     * {@link TieBreakStrategy#random(long)} with a fixed seed.
+     */
+    private TieBreakStrategy tieBreakStrategy = TieBreakStrategy.lexical();
 
     /**
      * Wraps the parent's filter+score search to record an
@@ -165,31 +191,62 @@ public class KubernetesScheduler extends VmAllocationPolicyTopologyAware {
      */
     @Override
     protected Optional<Host> defaultFindHostForVm(final Vm vm) {
-        // Build per-pass caches: placed-pod snapshot (M7) and lexical rank (E5).
-        placedCache = buildPlacedSnapshot();
-        lexicalRankCache = buildLexicalRankCache();
-        try {
-            Optional<Host> result = super.defaultFindHostForVm(vm);
-            
-            if (vm instanceof KubernetesPod pod) {
-                final double now = vm.getSimulation() == null ? 0.0 : vm.getSimulation().clock();
-                
-                // If standard placement fails, attempt eviction-style preemption
-                if (result.isEmpty() && pod.getPriority() > 0) {
-                    result = attemptPreemption(pod);
-                }
-
-                if (result.isEmpty()) {
-                    pod.markUnschedulable(now);
-                } else {
-                    pod.clearUnschedulable();
-                }
-            }
-            return result;
-        } finally {
-            placedCache = null;
-            lexicalRankCache = null;
+        // A1 P0b: caches persist across calls; rebuilt only when invalidated
+        // by allocateHostForVm / deallocateHostForVm. Lazy population keeps the
+        // first call's cost the same as before.
+        if (placedCache == null) {
+            placedCache = buildPlacedSnapshot();
         }
+        if (hostRankCache == null) {
+            hostRankCache = tieBreakStrategy.rank(new ArrayList<>(this.<Host>getHostList()));
+        }
+        Optional<Host> result = super.defaultFindHostForVm(vm);
+
+        if (vm instanceof KubernetesPod pod) {
+            final double now = vm.getSimulation() == null ? 0.0 : vm.getSimulation().clock();
+
+            // If standard placement fails, attempt eviction-style preemption.
+            if (result.isEmpty() && pod.getPriority() > 0) {
+                result = attemptPreemption(pod);
+            }
+
+            if (result.isEmpty()) {
+                pod.markUnschedulable(now);
+            } else {
+                pod.clearUnschedulable();
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Hook for the parent policy's successful-placement path. Invalidates the
+     * placed-pod cache so the next scheduling pass sees the new state.
+     */
+    @Override
+    public HostSuitability allocateHostForVm(final Vm vm, final Host host) {
+        final HostSuitability result = super.allocateHostForVm(vm, host);
+        if (result != null && result.fully()) {
+            invalidatePlacedCache();
+        }
+        return result;
+    }
+
+    /** Hook for deallocation events — invalidates the placed-pod cache. */
+    @Override
+    public void deallocateHostForVm(final Vm vm) {
+        super.deallocateHostForVm(vm);
+        invalidatePlacedCache();
+    }
+
+    /** Drops the placed-pods snapshot so the next placement attempt rebuilds it. */
+    public void invalidatePlacedCache() {
+        this.placedCache = null;
+    }
+
+    /** Drops the host-rank cache (called when nodes are added/removed). */
+    public void invalidateHostRankCache() {
+        this.hostRankCache = null;
     }
 
     /**
@@ -288,24 +345,6 @@ public class KubernetesScheduler extends VmAllocationPolicyTopologyAware {
             return false;
         }
         return passesRequiredPodAffinity(pod, node);
-    }
-
-    /**
-     * Builds a stable map from host id → rank in a lexical sort over
-     * {@link KubernetesNode#effectiveName()}. Hosts that aren't
-     * {@link KubernetesNode}s are ranked by id (still deterministic, but they
-     * never compete with K8s hosts in mixed scenarios anyway).
-     */
-    private Map<Long, Integer> buildLexicalRankCache() {
-        final java.util.List<Host> hosts = new java.util.ArrayList<>(this.<Host>getHostList());
-        hosts.sort(Comparator.comparing((Host h) -> h instanceof KubernetesNode kn
-            ? kn.effectiveName()
-            : Long.toString(h.getId())));
-        final Map<Long, Integer> ranks = new HashMap<>(hosts.size() * 2);
-        for (int i = 0; i < hosts.size(); i++) {
-            ranks.put(hosts.get(i).getId(), i);
-        }
-        return ranks;
     }
 
     private List<KubernetesPod> buildPlacedSnapshot() {
@@ -409,16 +448,20 @@ public class KubernetesScheduler extends VmAllocationPolicyTopologyAware {
         final double affinityBonus = pod.getNodeAffinity().preferredScore(node.getLabels());
         // PreferNoSchedule taints: each non-tolerated one nudges the score up.
         final double taintPenalty = preferNoSchedulePenalty(pod, node);
-        // NoSchedule/NoExecute taints the pod tolerates: intentional preference
-        // for the tainted node, treated as a bonus (better fit, score down).
-        final double tolerationBonus = taintTolerationBonus(pod, node);
+        // NoSchedule/NoExecute taints that the pod merely tolerates contribute
+        // nothing to the score: kube-scheduler's TaintToleration Score plugin
+        // ranks only by untolerated PreferNoSchedule taints and awards no
+        // preference for tolerating a hard taint. Awarding such a bonus made
+        // the simulator over-prefer tainted-but-tolerated nodes relative to
+        // kube-scheduler — a score-phase fidelity divergence (RQ1) — so it is
+        // not modelled.
         // Preferred PodAffinity / PodAntiAffinity contributions.
         final double podAffinityScore = preferredPodAffinityScore(pod, node);
         // All K8s-specific contributions are normalized so that they remain
         // comparable to the parent's score (cost / latency / spread) rather
         // than dominating it by orders of magnitude.
         final double k8sContrib =
-            (-affinityBonus + taintPenalty - tolerationBonus + podAffinityScore) * k8sScoreScale;
+            (-affinityBonus + taintPenalty + podAffinityScore) * k8sScoreScale;
         // Deterministic tie-break (E5): when every other component is equal,
         // the lexicographically smaller host name wins. The epsilon scaling
         // ensures this never overrides genuine score differences.
@@ -426,11 +469,72 @@ public class KubernetesScheduler extends VmAllocationPolicyTopologyAware {
     }
 
     private double lexicalTieBreak(final Host host) {
-        if (lexicalRankCache == null) {
+        if (hostRankCache == null) {
             return 0.0;
         }
-        final Integer rank = lexicalRankCache.get(host.getId());
+        final Integer rank = hostRankCache.get(host.getId());
         return rank == null ? 0.0 : rank * TIE_BREAK_EPSILON;
+    }
+
+    /**
+     * A4: Returns the set of nodes tied at the minimum score for {@code pod},
+     * excluding the {@link #TIE_BREAK_EPSILON} tie-break contribution. The
+     * returned set is what the upstream kube-scheduler's tie-break extension
+     * sees as its input — useful for cross-tool comparisons (B2 score-set
+     * agreement metric).
+     *
+     * <p>The returned list is in arbitrary order; callers that need the
+     * winner should apply {@link #getTieBreakStrategy()} explicitly.</p>
+     *
+     * @param pod the pod to score against the current host list
+     * @return the tied-minimum-score nodes, or empty if no node is feasible
+     */
+    public List<KubernetesNode> getCandidateNodes(final KubernetesPod pod) {
+        final var feasible = new ArrayList<KubernetesNode>();
+        final var scoresByHostId = new HashMap<Long, Double>();
+        // Build the placed cache once for this query so passesStrictConstraints
+        // and score() see a consistent view of the cluster.
+        final List<KubernetesPod> savedCache = placedCache;
+        try {
+            if (placedCache == null) {
+                placedCache = buildPlacedSnapshot();
+            }
+            for (final Host h : this.<Host>getHostList()) {
+                if (!(h instanceof KubernetesNode node)) {
+                    continue;
+                }
+                if (!passesStrictConstraints(pod, h)) {
+                    continue;
+                }
+                if (!h.getSuitabilityFor(pod).fully()) {
+                    continue;
+                }
+                feasible.add(node);
+                // Score without the tie-break epsilon to surface genuine ties.
+                scoresByHostId.put(h.getId(), scoreWithoutTieBreak(pod, h));
+            }
+        } finally {
+            placedCache = savedCache;
+        }
+        if (feasible.isEmpty()) {
+            return List.of();
+        }
+        final double minScore = feasible.stream()
+            .mapToDouble(n -> scoresByHostId.get(n.getId()))
+            .min().orElseThrow();
+        final var tied = new ArrayList<KubernetesNode>();
+        for (final var node : feasible) {
+            final double s = scoresByHostId.get(node.getId());
+            if (Math.abs(s - minScore) < TIE_BREAK_EPSILON) {
+                tied.add(node);
+            }
+        }
+        return tied;
+    }
+
+    /** Score components excluding the tie-break epsilon — used by {@link #getCandidateNodes}. */
+    private double scoreWithoutTieBreak(final KubernetesPod pod, final Host host) {
+        return score(pod, host) - lexicalTieBreak(host);
     }
 
     private double preferredPodAffinityScore(final KubernetesPod pod, final KubernetesNode node) {
@@ -464,21 +568,5 @@ public class KubernetesScheduler extends VmAllocationPolicyTopologyAware {
             }
         }
         return penalty;
-    }
-
-    private static double taintTolerationBonus(final KubernetesPod pod, final KubernetesNode node) {
-        if (pod.getTolerations().isEmpty() || node.getTaints().isEmpty()) {
-            return 0.0;
-        }
-        double bonus = 0.0;
-        for (final var taint : node.getTaints()) {
-            if (taint.effect() == Taint.Effect.PREFER_NO_SCHEDULE) {
-                continue;
-            }
-            if (pod.getTolerations().stream().anyMatch(t -> t.tolerates(taint))) {
-                bonus += TAINT_TOLERATION_BONUS;
-            }
-        }
-        return bonus;
     }
 }

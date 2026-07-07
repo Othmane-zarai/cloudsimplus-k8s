@@ -29,6 +29,7 @@ import org.cloudsimplus.kubernetes.KubernetesContainer;
 import org.cloudsimplus.kubernetes.KubernetesPod;
 import org.cloudsimplus.kubernetes.Namespace;
 import org.cloudsimplus.kubernetes.Resources;
+import org.cloudsimplus.kubernetes.autoscaling.VerticalPodAutoscaler.Mode;
 import org.cloudsimplus.kubernetes.controllers.PodTemplate;
 import org.cloudsimplus.kubernetes.controllers.ReplicaSetController;
 import org.junit.jupiter.api.Test;
@@ -36,6 +37,8 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class VerticalPodAutoscalerTest {
@@ -91,5 +94,48 @@ class VerticalPodAutoscalerTest {
         assertEquals(false, vpa.isEvictOnRecommendation());
         vpa.setEvictOnRecommendation(true);
         assertTrue(vpa.isEvictOnRecommendation());
+    }
+
+    // ── Auto-mode / in-place resize tests ────────────────────────────────────
+
+    @Test
+    void defaultModeIsInitial() {
+        final var vpa = new VerticalPodAutoscaler("vpa", newRs());
+        assertEquals(Mode.INITIAL, vpa.getMode());
+    }
+
+    @Test
+    void setModeRoundTrips() {
+        final var vpa = new VerticalPodAutoscaler("vpa", newRs());
+        vpa.setMode(Mode.AUTO);
+        assertEquals(Mode.AUTO, vpa.getMode());
+        vpa.setMode(Mode.OFF);
+        assertEquals(Mode.OFF, vpa.getMode());
+    }
+
+    @Test
+    void effectiveLimitsInitiallyEqualsDeclaredLimits() {
+        final var res = Resources.of("500m", "256Mi");
+        final var c = new KubernetesContainer("c", 1, res);
+        // Before any VPA resize, effectiveLimits must be the same object as limits.
+        assertSame(c.getLimits(), c.getEffectiveLimits(),
+            "effectiveLimits must start as the same reference as limits");
+    }
+
+    @Test
+    void applyInPlaceResizeUpdatesEffectiveLimitsWithoutChangingDeclaredLimits() {
+        final var original = Resources.of("500m", "256Mi");
+        final var c = new KubernetesContainer("c", 1, original);
+        final var resized = Resources.of("700m", "256Mi");
+
+        c.applyInPlaceResize(resized);
+
+        // Declared spec is unchanged.
+        assertSame(original, c.getLimits(), "declared limits must not change after in-place resize");
+        // Effective limits reflect the resize.
+        assertEquals(700L, c.getEffectiveLimits().milliCpu(),
+            "effectiveLimits.milliCpu must reflect the in-place resize");
+        assertNotSame(c.getLimits(), c.getEffectiveLimits(),
+            "effectiveLimits must be a different object after resize");
     }
 }
