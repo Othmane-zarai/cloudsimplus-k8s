@@ -15,18 +15,15 @@ authors:
     given-names: Widad
   - family-names: Driss
     given-names: Riane
-version: 1.0.0-k8s
+version: 1.0.3
 doi: 10.5281/zenodo.21251756
-date-released: "2026-07-07"
+date-released: "2026-07-08"
 license: GPL-3.0-or-later
 repository-code: "https://github.com/Othmane-zarai/cloudsimplus-k8s"
 identifiers:
   - type: doi
     value: "10.5281/zenodo.21251756"
     description: "Concept DOI (resolves to the latest version)"
-  - type: doi
-    value: "10.5281/zenodo.21251757"
-    description: "Version 1.0.0-k8s (git tag v1.0.2)"
 keywords:
   - CloudSim Plus
   - Kubernetes

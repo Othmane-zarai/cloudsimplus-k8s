@@ -4,7 +4,7 @@
   "upload_type": "software",
   "license": "GPL-3.0-or-later",
   "access_right": "open",
-  "version": "1.0.0-k8s",
+  "version": "1.0.3",
   "creators": [
     { "name": "Zarai, Othmane", "orcid": "0009-0007-0222-586X" },
     { "name": "Ettazi, Widad" },
